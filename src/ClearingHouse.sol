@@ -321,87 +321,54 @@ contract ClearingHouse is AccessControl, ReentrancyGuard {
         nonReentrant
         onlyRole(KEEPER_ROLE)
     {
-        MarketConfig storage cfg = _active(marketId);
-        _settleFundingOnAccount(marketId, account);
-        Position storage pos = positions[account][marketId];
-        if (pos.size == 0) revert NoPosition();
+        _liquidate(marketId, account, closeSize, msg.sender);
+    }
 
-        uint256 mark = _mark(cfg);
-        if (!RiskLib.liquidatable(
-                pos.size,
-                pos.margin,
-                pos.entryPrice,
-                mark,
-                _pendingFunding(marketId, pos),
-                cfg.maintenanceMarginBps
-            )) revert NotLiquidatable();
-
-        uint256 absSize = PositionLib.abs(pos.size);
-        if (closeSize == 0 || closeSize > absSize) closeSize = absSize;
-
-        int256 closed = pos.size > 0 ? int256(closeSize) : -int256(closeSize);
-        int256 pnl = PositionLib.unrealizedPnl(closed, pos.entryPrice, mark);
-        uint256 marginSlice = (pos.margin * closeSize) / absSize;
-        int256 eq = PositionLib.equity(marginSlice, pnl, 0);
-        uint256 notionalUsd = PositionLib.notional(closed, mark);
-        uint256 penalty = RiskLib.liquidationPenalty(notionalUsd, cfg.liquidationPenaltyBps);
-        uint256 keeperReward = RiskLib.keeperShare(penalty, cfg.keeperIncentiveBps);
-
-        uint256 covered;
-        if (eq > 0) {
-            uint256 eqU = uint256(eq);
-            if (eqU >= penalty) {
-                _payFee(penalty - keeperReward);
-                if (keeperReward > 0) freeCollateral[msg.sender] += keeperReward;
-                freeCollateral[account] += eqU - penalty;
-            } else {
-                uint256 toIns = eqU > keeperReward ? eqU - keeperReward : 0;
-                if (keeperReward > 0) {
-                    uint256 tip = eqU < keeperReward ? eqU : keeperReward;
-                    freeCollateral[msg.sender] += tip;
-                    keeperReward = tip;
-                }
-                _payFee(toIns);
-            }
-        } else {
-            uint256 shortfall = uint256(-eq);
-            covered = insuranceFund.cover(address(this), shortfall + penalty);
-            uint256 afterShortfall = covered > shortfall ? covered - shortfall : 0;
-            if (afterShortfall >= keeperReward && keeperReward > 0) {
-                freeCollateral[msg.sender] += keeperReward;
-                _payFee(afterShortfall - keeperReward);
-            } else if (afterShortfall > 0) {
-                freeCollateral[msg.sender] += afterShortfall;
-                keeperReward = afterShortfall;
-            } else {
-                keeperReward = 0;
-            }
+    /// @notice Batch liquidate many accounts on one market (skips healthy / empty).
+    function batchLiquidate(uint256 marketId, address[] calldata accounts, uint256 closeSize)
+        external
+        nonReentrant
+        onlyRole(KEEPER_ROLE)
+        returns (uint256 liquidated)
+    {
+        uint256 n = accounts.length;
+        for (uint256 i = 0; i < n; i++) {
+            address account = accounts[i];
+            Position storage pos = positions[account][marketId];
+            if (pos.size == 0) continue;
+            MarketConfig storage cfg = markets[marketId];
+            if (!cfg.listed || cfg.paused) continue;
+            _settleFundingOnAccount(marketId, account);
+            if (
+                !RiskLib.liquidatable(
+                    pos.size,
+                    pos.margin,
+                    pos.entryPrice,
+                    _mark(cfg),
+                    _pendingFunding(marketId, pos),
+                    cfg.maintenanceMarginBps
+                )
+            ) continue;
+            _liquidate(marketId, account, closeSize, msg.sender);
+            liquidated++;
         }
+    }
 
-        pos.margin -= marginSlice;
-        pos.size -= closed;
-        _applyOIClose(marketState[marketId], closed);
-        if (pos.size == 0) delete positions[account][marketId];
-
-        emit Liquidated(account, marketId, msg.sender, closed, eq, penalty, keeperReward, covered);
+    /// @notice Settle funding across many markets in one keeper tick.
+    function settleFundingBatch(uint256[] calldata marketIds)
+        external
+        onlyRole(KEEPER_ROLE)
+        returns (uint256 settled)
+    {
+        uint256 n = marketIds.length;
+        for (uint256 i = 0; i < n; i++) {
+            if (_trySettleFunding(marketIds[i])) settled++;
+        }
     }
 
     /// @notice Keeper tick: recompute skew funding and bump cumulative index.
     function settleFunding(uint256 marketId) external onlyRole(KEEPER_ROLE) {
-        MarketConfig storage cfg = _listed(marketId);
-        MarketState storage st = marketState[marketId];
-        if (block.timestamp < st.lastFundingTime + cfg.fundingInterval) revert FundingNotDue();
-
-        int256 premium = FundingLib.skewPremium(st.longOpenInterest, st.shortOpenInterest);
-        int256 rate =
-            FundingLib.cappedRate(premium, cfg.fundingSensitivityWad, cfg.maxFundingRateWad);
-        // allow manual override if risk set a non-zero sticky rate and sensitivity is 0
-        if (cfg.fundingSensitivityWad == 0) rate = st.fundingRateWad;
-        else st.fundingRateWad = rate;
-
-        st.cumulativeFunding += rate;
-        st.lastFundingTime = block.timestamp;
-        emit FundingSettled(marketId, rate, st.cumulativeFunding, block.timestamp);
+        if (!_trySettleFunding(marketId)) revert FundingNotDue();
     }
 
     // -------- views --------
@@ -456,6 +423,94 @@ contract ClearingHouse is AccessControl, ReentrancyGuard {
     }
 
     // ---- internals ----
+
+    function _trySettleFunding(uint256 marketId) internal returns (bool) {
+        MarketConfig storage cfg = markets[marketId];
+        if (!cfg.listed) return false;
+        MarketState storage st = marketState[marketId];
+        if (block.timestamp < st.lastFundingTime + cfg.fundingInterval) return false;
+
+        int256 premium = FundingLib.skewPremium(st.longOpenInterest, st.shortOpenInterest);
+        int256 rate =
+            FundingLib.cappedRate(premium, cfg.fundingSensitivityWad, cfg.maxFundingRateWad);
+        if (cfg.fundingSensitivityWad == 0) rate = st.fundingRateWad;
+        else st.fundingRateWad = rate;
+
+        st.cumulativeFunding += rate;
+        st.lastFundingTime = block.timestamp;
+        emit FundingSettled(marketId, rate, st.cumulativeFunding, block.timestamp);
+        return true;
+    }
+
+    function _liquidate(uint256 marketId, address account, uint256 closeSize, address keeper)
+        internal
+    {
+        MarketConfig storage cfg = _active(marketId);
+        _settleFundingOnAccount(marketId, account);
+        Position storage pos = positions[account][marketId];
+        if (pos.size == 0) revert NoPosition();
+
+        uint256 mark = _mark(cfg);
+        if (
+            !RiskLib.liquidatable(
+                pos.size,
+                pos.margin,
+                pos.entryPrice,
+                mark,
+                _pendingFunding(marketId, pos),
+                cfg.maintenanceMarginBps
+            )
+        ) revert NotLiquidatable();
+
+        uint256 absSize = PositionLib.abs(pos.size);
+        if (closeSize == 0 || closeSize > absSize) closeSize = absSize;
+
+        int256 closed = pos.size > 0 ? int256(closeSize) : -int256(closeSize);
+        int256 pnl = PositionLib.unrealizedPnl(closed, pos.entryPrice, mark);
+        uint256 marginSlice = (pos.margin * closeSize) / absSize;
+        int256 eq = PositionLib.equity(marginSlice, pnl, 0);
+        uint256 notionalUsd = PositionLib.notional(closed, mark);
+        uint256 penalty = RiskLib.liquidationPenalty(notionalUsd, cfg.liquidationPenaltyBps);
+        uint256 keeperReward = RiskLib.keeperShare(penalty, cfg.keeperIncentiveBps);
+
+        uint256 covered;
+        if (eq > 0) {
+            uint256 eqU = uint256(eq);
+            if (eqU >= penalty) {
+                _payFee(penalty - keeperReward);
+                if (keeperReward > 0) freeCollateral[keeper] += keeperReward;
+                freeCollateral[account] += eqU - penalty;
+            } else {
+                uint256 toIns = eqU > keeperReward ? eqU - keeperReward : 0;
+                if (keeperReward > 0) {
+                    uint256 tip = eqU < keeperReward ? eqU : keeperReward;
+                    freeCollateral[keeper] += tip;
+                    keeperReward = tip;
+                }
+                _payFee(toIns);
+            }
+        } else {
+            uint256 shortfall = uint256(-eq);
+            covered = insuranceFund.cover(address(this), shortfall + penalty);
+            uint256 afterShortfall = covered > shortfall ? covered - shortfall : 0;
+            if (afterShortfall >= keeperReward && keeperReward > 0) {
+                freeCollateral[keeper] += keeperReward;
+                _payFee(afterShortfall - keeperReward);
+            } else if (afterShortfall > 0) {
+                freeCollateral[keeper] += afterShortfall;
+                keeperReward = afterShortfall;
+            } else {
+                keeperReward = 0;
+            }
+        }
+
+        pos.margin -= marginSlice;
+        pos.size -= closed;
+        _applyOIClose(marketState[marketId], closed);
+        if (pos.size == 0) delete positions[account][marketId];
+
+        emit Liquidated(account, marketId, keeper, closed, eq, penalty, keeperReward, covered);
+    }
 
     function _symbolExists(string memory symbol) internal view returns (bool) {
         uint256 slot = _symbolToId[symbol];

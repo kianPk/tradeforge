@@ -77,3 +77,8 @@ BoundOracle deviation/heartbeat · PositionLib/FundingLib · fuzz
 ## Disclaimer
 
 Educational / research protocol lab. **Not audited.** Do not deploy with real funds.
+
+## Keeper helpers (feat branch)
+
+- `batchLiquidate(marketId, accounts, closeSize)` — skip healthy/empty accounts
+- `settleFundingBatch(marketIds)` — one tick across listed markets due for funding
