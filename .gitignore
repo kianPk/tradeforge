@@ -1,0 +1,16 @@
+# Compiler files
+cache/
+out/
+
+# Commonly ignored directories
+.logs/
+.ignore/
+
+# Broadcast logs
+/broadcast/*/31337/
+/broadcast/**/dry-run/
+
+# Dotenv
+.env
+.env.*
+!.env.example

@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TradeForge — Multi-Market Perpetual Clearing</title>
+  <meta name="description" content="Solidity perpetual clearing protocol — multi-market isolated margin, skew funding, keeper liquidations, insurance fund. Foundry + OpenZeppelin." />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@450;600;700&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <div class="mark" aria-hidden="true"></div>
+      <div>
+        <h1>TradeForge</h1>
+        <p>Multi-market perpetual clearing · Foundry</p>
+      </div>
+    </div>
+    <div class="header-actions">
+      <a class="pill" href="https://github.com/kianPk/tradeforge" target="_blank" rel="noopener">GitHub</a>
+      <a class="pill ghost" href="https://github.com/kianPk/tradeforge#readme" target="_blank" rel="noopener">Docs</a>
+    </div>
+  </header>
+
+  <section class="hero-iso" aria-hidden="true">
+    <div class="slab"></div>
+    <div class="tower"></div>
+    <div class="tower t2"></div>
+    <div class="chip c1">ETH-PERP</div>
+    <div class="chip c2">BTC-PERP</div>
+    <div class="chip c3">skew funding</div>
+    <div class="chip c4">liquidate</div>
+  </section>
+
+  <section class="kpis">
+    <div><b>N markets</b><span>isolated margin</span></div>
+    <div><b>20x</b><span>max leverage</span></div>
+    <div><b>skew</b><span>auto funding</span></div>
+    <div><b>keepers</b><span>partial liq + tip</span></div>
+  </section>
+
+  <div class="grid">
+    <section class="panel sim wide">
+      <div class="sim-head">
+        <h2>Position desk</h2>
+        <div class="tabs" role="tablist">
+          <button type="button" class="tab on" data-side="long">Long</button>
+          <button type="button" class="tab" data-side="short">Short</button>
+        </div>
+      </div>
+      <div class="sim-body">
+        <label>Market
+          <select id="market">
+            <option value="eth">ETH-PERP · $2,000</option>
+            <option value="btc">BTC-PERP · $60,000</option>
+          </select>
+        </label>
+        <label>Size (base)
+          <input id="size" type="number" min="0.01" step="0.01" value="1" />
+        </label>
+        <label>Margin (USD)
+          <input id="margin" type="number" min="10" step="10" value="500" />
+        </label>
+        <label>Mark move %
+          <input id="move" type="range" min="-40" max="40" value="10" />
+          <span id="moveVal" class="mono">+10%</span>
+        </label>
+      </div>
+      <div class="sim-out">
+        <div><span>Notional</span><b id="oNotional">—</b></div>
+        <div><span>Leverage</span><b id="oLev">—</b></div>
+        <div><span>Est. fee</span><b id="oFee">—</b></div>
+        <div><span>uPnL</span><b id="oPnl">—</b></div>
+        <div><span>Equity</span><b id="oEq">—</b></div>
+        <div><span>Status</span><b id="oStatus">—</b></div>
+      </div>
+      <p class="hint">Client-side desk mirroring on-chain math (1e18 WAD). Run <code>forge test</code> for the full engine — multi-market, skew funding, partial liquidations, BoundOracle.</p>
+    </section>
+
+    <section class="panel">
+      <h2>Protocol surface</h2>
+      <ul class="list">
+        <li><code>ClearingHouse</code> — list markets, deposit, open/close, margin, liquidate</li>
+        <li><code>InsuranceFund</code> — fee sink + bad-debt cover</li>
+        <li><code>BoundOracle</code> — deviation + heartbeat guards</li>
+        <li><code>FundingLib</code> — skew premium → capped rate</li>
+        <li><code>RiskLib</code> / <code>PositionLib</code> — leverage, MMR, blend entry</li>
+      </ul>
+    </section>
+
+    <section class="panel">
+      <h2>Quick start</h2>
+      <pre>git clone https://github.com/kianPk/tradeforge
+cd tradeforge
+forge install
+forge test
+forge script script/Deploy.s.sol</pre>
+    </section>
+
+    <section class="panel wide">
+      <h2>Lifecycle</h2>
+      <div class="flow">
+        <div>List market</div><span>→</span>
+        <div>Deposit collateral</div><span>→</span>
+        <div>Open long / short</div><span>→</span>
+        <div>Skew funding tick</div><span>→</span>
+        <div>Close or liquidate</div>
+      </div>
+    </section>
+  </div>
+
+  <footer>
+    <p>Educational protocol lab · MIT · Not audited · Do not deploy with real funds.</p>
+  </footer>
+  <script src="./app.js"></script>
+</body>
+</html>
