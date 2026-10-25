@@ -208,6 +208,59 @@ contract TradeForgeTest is Test {
         assertEq(PositionLib.abs(house.positionOf(alice, ethId).size), 1e18);
     }
 
+    function test_protocolPauseBlocksTrading() public {
+        _deposit(alice, 10_000e18);
+        house.setProtocolPaused(true);
+        vm.prank(alice);
+        vm.expectRevert(ClearingHouse.ProtocolPaused.selector);
+        house.openPosition(ethId, 1e18, 3000e18);
+        house.setProtocolPaused(false);
+        vm.prank(alice);
+        house.openPosition(ethId, 1e18, 3000e18);
+    }
+
+    function test_batchLiquidateSkipsHealthy() public {
+        _deposit(alice, 5_000e18);
+        _deposit(bob, 20_000e18);
+        vm.prank(alice);
+        house.openPosition(ethId, 2e18, 2500e18);
+        vm.prank(bob);
+        house.openPosition(ethId, 1e18, 5000e18);
+
+        usdc.approve(address(insurance), type(uint256).max);
+        usdc.transfer(address(insurance), 50_000e18);
+
+        ethOracle.setPrice(500e18);
+        assertTrue(house.isLiquidatable(alice, ethId));
+        assertFalse(house.isLiquidatable(bob, ethId));
+
+        address[] memory accounts = new address[](2);
+        accounts[0] = alice;
+        accounts[1] = bob;
+        uint256 n = house.batchLiquidate(ethId, accounts, 0);
+        assertEq(n, 1);
+        assertEq(house.positionOf(alice, ethId).size, 0);
+        assertEq(house.positionOf(bob, ethId).size, 1e18);
+    }
+
+    function test_settleFundingBatch() public {
+        _deposit(alice, 50_000e18);
+        vm.prank(alice);
+        house.openPosition(ethId, 2e18, 8_000e18);
+        vm.prank(alice);
+        house.openPosition(btcId, 1e18, 20_000e18);
+
+        vm.warp(block.timestamp + 1 hours + 1);
+        uint256[] memory ids = new uint256[](2);
+        ids[0] = ethId;
+        ids[1] = btcId;
+        uint256 settled = house.settleFundingBatch(ids);
+        assertEq(settled, 2);
+        // not due yet — skipped
+        settled = house.settleFundingBatch(ids);
+        assertEq(settled, 0);
+    }
+
     function test_keeperReceivesIncentive() public {
         address liqKeeper = makeAddr("liqKeeper");
         house.grantRole(house.KEEPER_ROLE(), liqKeeper);

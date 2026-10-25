@@ -3,7 +3,7 @@
 **Multi-market perpetual futures clearing in Solidity** — isolated-margin long/short across listed markets, skew-based funding, trading fees, partial keeper liquidations with incentives, and an insurance fund. Built with Foundry + OpenZeppelin.
 
 ![Solidity](https://img.shields.io/badge/Solidity-0.8.24-363636?logo=solidity)
-![Foundry](https://img.shields.io/badge/Foundry-21%20tests-22d3ee)
+![Foundry](https://img.shields.io/badge/Foundry-24%20tests-22d3ee)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 
 ## Why this exists
@@ -14,7 +14,7 @@ TradeForge is a production-shaped derivatives risk lab — not a single-market t
 
 | Piece | Role |
 |---|---|
-| `ClearingHouse` | List/pause markets · deposit/withdraw · open/increase · close · add/remove margin · partial liquidate · funding settle |
+| `ClearingHouse` | List/pause markets · **protocol pause** · deposit/withdraw · open/increase · close · add/remove margin · partial + **batch liquidate** · funding settle / **batch funding** |
 | `InsuranceFund` | Fee sink · covers shortfalls on toxic liquidations |
 | `BoundOracle` | Mark feed with max deviation + heartbeat staleness |
 | `MockOracle` | Simple lab feed |

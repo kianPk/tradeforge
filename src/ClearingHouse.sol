@@ -29,6 +29,8 @@ contract ClearingHouse is AccessControl, ReentrancyGuard {
     InsuranceFund public insuranceFund;
 
     uint256 public marketCount;
+    /// @notice When true, all trading / margin / liquidation entrypoints revert.
+    bool public protocolPaused;
     mapping(uint256 => MarketConfig) public markets;
     mapping(uint256 => MarketState) public marketState;
 
@@ -79,6 +81,8 @@ contract ClearingHouse is AccessControl, ReentrancyGuard {
     event FundingSettled(
         uint256 indexed marketId, int256 fundingRateWad, int256 cumulativeFunding, uint256 timestamp
     );
+    event ProtocolPause(bool paused);
+    event BatchLiquidated(uint256 indexed marketId, uint256 count);
 
     error ZeroAmount();
     error InsufficientCollateral();
@@ -92,7 +96,9 @@ contract ClearingHouse is AccessControl, ReentrancyGuard {
     error CloseTooLarge();
     error MarketUnknown();
     error MarketPaused();
+    error ProtocolPaused();
     error SymbolTaken();
+    error EmptyBatch();
 
     mapping(string => uint256) private _symbolToId;
     mapping(uint256 => string) public idToSymbol;
@@ -176,6 +182,12 @@ contract ClearingHouse is AccessControl, ReentrancyGuard {
         emit MarketPause(marketId, paused);
     }
 
+    /// @notice Halt every market at once (incident response / upgrade window).
+    function setProtocolPaused(bool paused) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        protocolPaused = paused;
+        emit ProtocolPause(paused);
+    }
+
     function setFundingRate(uint256 marketId, int256 rateWad) external onlyRole(RISK_ROLE) {
         MarketConfig storage cfg = _listed(marketId);
         int256 maxR = int256(cfg.maxFundingRateWad);
@@ -186,6 +198,7 @@ contract ClearingHouse is AccessControl, ReentrancyGuard {
     // -------- collateral --------
 
     function deposit(uint256 amount) external nonReentrant {
+        _requireProtocolLive();
         if (amount == 0) revert ZeroAmount();
         collateral.safeTransferFrom(msg.sender, address(this), amount);
         freeCollateral[msg.sender] += amount;
@@ -193,6 +206,7 @@ contract ClearingHouse is AccessControl, ReentrancyGuard {
     }
 
     function withdraw(uint256 amount) external nonReentrant {
+        _requireProtocolLive();
         if (amount == 0) revert ZeroAmount();
         if (freeCollateral[msg.sender] < amount) revert InsufficientCollateral();
         freeCollateral[msg.sender] -= amount;
@@ -207,6 +221,7 @@ contract ClearingHouse is AccessControl, ReentrancyGuard {
         external
         nonReentrant
     {
+        _requireProtocolLive();
         MarketConfig storage cfg = _active(marketId);
         if (sizeDelta == 0 || marginToAdd == 0) revert ZeroAmount();
 
@@ -247,6 +262,7 @@ contract ClearingHouse is AccessControl, ReentrancyGuard {
 
     /// @notice Close `closeSize` base units of the current position (absolute).
     function closePosition(uint256 marketId, uint256 closeSize) external nonReentrant {
+        _requireProtocolLive();
         MarketConfig storage cfg = _active(marketId);
         if (closeSize == 0) revert ZeroAmount();
         _settleFundingOnAccount(marketId, msg.sender);
@@ -279,6 +295,7 @@ contract ClearingHouse is AccessControl, ReentrancyGuard {
     }
 
     function addMargin(uint256 marketId, uint256 amount) external nonReentrant {
+        _requireProtocolLive();
         _active(marketId);
         if (amount == 0) revert ZeroAmount();
         Position storage pos = positions[msg.sender][marketId];
@@ -290,6 +307,7 @@ contract ClearingHouse is AccessControl, ReentrancyGuard {
     }
 
     function removeMargin(uint256 marketId, uint256 amount) external nonReentrant {
+        _requireProtocolLive();
         MarketConfig storage cfg = _active(marketId);
         if (amount == 0) revert ZeroAmount();
         _settleFundingOnAccount(marketId, msg.sender);
@@ -321,7 +339,127 @@ contract ClearingHouse is AccessControl, ReentrancyGuard {
         nonReentrant
         onlyRole(KEEPER_ROLE)
     {
-        MarketConfig storage cfg = _active(marketId);
+        _requireProtocolLive();
+        _liquidate(marketId, account, closeSize);
+    }
+
+    /// @notice Liquidate many underwater accounts in one keeper transaction.
+    /// @dev Skips accounts that are not liquidatable (no revert) so keepers can
+    ///      submit optimistic candidate lists without exact pre-filtering.
+    function batchLiquidate(uint256 marketId, address[] calldata accounts, uint256 closeSize)
+        external
+        nonReentrant
+        onlyRole(KEEPER_ROLE)
+        returns (uint256 liquidated)
+    {
+        _requireProtocolLive();
+        if (accounts.length == 0) revert EmptyBatch();
+        _active(marketId); // validate market once
+        for (uint256 i = 0; i < accounts.length; i++) {
+            address account = accounts[i];
+            Position storage pos = positions[account][marketId];
+            if (pos.size == 0) continue;
+            MarketConfig storage cfg = markets[marketId];
+            uint256 mark = _mark(cfg);
+            _settleFundingOnAccount(marketId, account);
+            pos = positions[account][marketId];
+            if (pos.size == 0) continue;
+            if (!RiskLib.liquidatable(
+                    pos.size,
+                    pos.margin,
+                    pos.entryPrice,
+                    mark,
+                    _pendingFunding(marketId, pos),
+                    cfg.maintenanceMarginBps
+                )) continue;
+            _liquidate(marketId, account, closeSize);
+            liquidated++;
+        }
+        emit BatchLiquidated(marketId, liquidated);
+    }
+
+    /// @notice Keeper tick: recompute skew funding and bump cumulative index.
+    function settleFunding(uint256 marketId) external onlyRole(KEEPER_ROLE) {
+        _settleFundingOne(marketId);
+    }
+
+    /// @notice Settle funding across several markets (due markets only; others skipped).
+    function settleFundingBatch(uint256[] calldata marketIds)
+        external
+        onlyRole(KEEPER_ROLE)
+        returns (uint256 settled)
+    {
+        for (uint256 i = 0; i < marketIds.length; i++) {
+            uint256 marketId = marketIds[i];
+            MarketConfig storage cfg = markets[marketId];
+            if (!cfg.listed) continue;
+            MarketState storage st = marketState[marketId];
+            if (block.timestamp < st.lastFundingTime + cfg.fundingInterval) continue;
+            _settleFundingOne(marketId);
+            settled++;
+        }
+    }
+
+    // -------- views --------
+
+    function markPrice(uint256 marketId) external view returns (uint256) {
+        return _mark(_listed(marketId));
+    }
+
+    function accountEquity(address account, uint256 marketId) external view returns (int256) {
+        MarketConfig storage cfg = _listed(marketId);
+        Position memory pos = positions[account][marketId];
+        int256 free = int256(freeCollateral[account]);
+        if (pos.size == 0) return free;
+        uint256 mark = _mark(cfg);
+        int256 pnl = PositionLib.unrealizedPnl(pos.size, pos.entryPrice, mark);
+        int256 fundingDebt = _pendingFunding(marketId, pos);
+        return PositionLib.equity(pos.margin, pnl, fundingDebt) + free;
+    }
+
+    function isLiquidatable(address account, uint256 marketId) external view returns (bool) {
+        MarketConfig storage cfg = _listed(marketId);
+        Position memory pos = positions[account][marketId];
+        if (pos.size == 0) return false;
+        return RiskLib.liquidatable(
+            pos.size,
+            pos.margin,
+            pos.entryPrice,
+            _mark(cfg),
+            _pendingFunding(marketId, pos),
+            cfg.maintenanceMarginBps
+        );
+    }
+
+    function positionOf(address account, uint256 marketId) external view returns (Position memory) {
+        return positions[account][marketId];
+    }
+
+    function openInterestUsd(uint256 marketId) public view returns (uint256) {
+        MarketConfig storage cfg = _listed(marketId);
+        MarketState storage st = marketState[marketId];
+        uint256 mark = _mark(cfg);
+        return PositionLib.notional(int256(st.longOpenInterest), mark)
+            + PositionLib.notional(int256(st.shortOpenInterest), mark);
+    }
+
+    function previewFundingRate(uint256 marketId) external view returns (int256) {
+        MarketConfig storage cfg = _listed(marketId);
+        MarketState storage st = marketState[marketId];
+        if (cfg.fundingSensitivityWad == 0) return st.fundingRateWad;
+        int256 premium = FundingLib.skewPremium(st.longOpenInterest, st.shortOpenInterest);
+        return FundingLib.cappedRate(premium, cfg.fundingSensitivityWad, cfg.maxFundingRateWad);
+    }
+
+    // ---- internals ----
+
+    function _requireProtocolLive() internal view {
+        if (protocolPaused) revert ProtocolPaused();
+    }
+
+    function _liquidate(uint256 marketId, address account, uint256 closeSize) internal {
+        MarketConfig storage cfg = _listed(marketId);
+        if (cfg.paused) revert MarketPaused();
         _settleFundingOnAccount(marketId, account);
         Position storage pos = positions[account][marketId];
         if (pos.size == 0) revert NoPosition();
@@ -386,8 +524,7 @@ contract ClearingHouse is AccessControl, ReentrancyGuard {
         emit Liquidated(account, marketId, msg.sender, closed, eq, penalty, keeperReward, covered);
     }
 
-    /// @notice Keeper tick: recompute skew funding and bump cumulative index.
-    function settleFunding(uint256 marketId) external onlyRole(KEEPER_ROLE) {
+    function _settleFundingOne(uint256 marketId) internal {
         MarketConfig storage cfg = _listed(marketId);
         MarketState storage st = marketState[marketId];
         if (block.timestamp < st.lastFundingTime + cfg.fundingInterval) revert FundingNotDue();
@@ -403,59 +540,6 @@ contract ClearingHouse is AccessControl, ReentrancyGuard {
         st.lastFundingTime = block.timestamp;
         emit FundingSettled(marketId, rate, st.cumulativeFunding, block.timestamp);
     }
-
-    // -------- views --------
-
-    function markPrice(uint256 marketId) external view returns (uint256) {
-        return _mark(_listed(marketId));
-    }
-
-    function accountEquity(address account, uint256 marketId) external view returns (int256) {
-        MarketConfig storage cfg = _listed(marketId);
-        Position memory pos = positions[account][marketId];
-        int256 free = int256(freeCollateral[account]);
-        if (pos.size == 0) return free;
-        uint256 mark = _mark(cfg);
-        int256 pnl = PositionLib.unrealizedPnl(pos.size, pos.entryPrice, mark);
-        int256 fundingDebt = _pendingFunding(marketId, pos);
-        return PositionLib.equity(pos.margin, pnl, fundingDebt) + free;
-    }
-
-    function isLiquidatable(address account, uint256 marketId) external view returns (bool) {
-        MarketConfig storage cfg = _listed(marketId);
-        Position memory pos = positions[account][marketId];
-        if (pos.size == 0) return false;
-        return RiskLib.liquidatable(
-            pos.size,
-            pos.margin,
-            pos.entryPrice,
-            _mark(cfg),
-            _pendingFunding(marketId, pos),
-            cfg.maintenanceMarginBps
-        );
-    }
-
-    function positionOf(address account, uint256 marketId) external view returns (Position memory) {
-        return positions[account][marketId];
-    }
-
-    function openInterestUsd(uint256 marketId) public view returns (uint256) {
-        MarketConfig storage cfg = _listed(marketId);
-        MarketState storage st = marketState[marketId];
-        uint256 mark = _mark(cfg);
-        return PositionLib.notional(int256(st.longOpenInterest), mark)
-            + PositionLib.notional(int256(st.shortOpenInterest), mark);
-    }
-
-    function previewFundingRate(uint256 marketId) external view returns (int256) {
-        MarketConfig storage cfg = _listed(marketId);
-        MarketState storage st = marketState[marketId];
-        if (cfg.fundingSensitivityWad == 0) return st.fundingRateWad;
-        int256 premium = FundingLib.skewPremium(st.longOpenInterest, st.shortOpenInterest);
-        return FundingLib.cappedRate(premium, cfg.fundingSensitivityWad, cfg.maxFundingRateWad);
-    }
-
-    // ---- internals ----
 
     function _symbolExists(string memory symbol) internal view returns (bool) {
         uint256 slot = _symbolToId[symbol];
